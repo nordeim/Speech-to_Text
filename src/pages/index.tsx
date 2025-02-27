@@ -50,26 +50,82 @@ const SpeechToTextConverter = () => {
     }
   };
 
-  const stopRecognition = () => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-        setIsRecognitionActive(false);
-      } catch (e) {
-        console.log('Recognition was not active');
+  const initializeRecognition = () => {
+    if (recognitionRef.current) return; // Prevent multiple initializations
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognitionRef.current = new SpeechRecognition();
+    recognitionRef.current.continuous = true;
+    recognitionRef.current.interimResults = true;
+    recognitionRef.current.lang = 'en-US';
+
+    recognitionRef.current.onresult = (event: any) => {
+      let finalTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript + ' ';
+        }
       }
+      setTranscript((prev) => prev + finalTranscript);
+    };
+
+    recognitionRef.current.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error);
+      if (event.error !== 'no-speech') {
+        setError('Speech recognition error. Please try again.');
+        setIsRecording(false);
+        setIsRecognitionActive(false);
+      }
+    };
+
+    recognitionRef.current.onstart = () => {
+      setIsRecognitionActive(true);
+    };
+
+    recognitionRef.current.onend = () => {
+      setIsRecognitionActive(false);
+    };
+  };
+
+  const stopRecognition = async () => {
+    try {
+      if (recognitionRef.current) {
+        // Remove all event listeners first
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onstart = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onresult = null;
+        
+        // Stop recognition and wait a bit
+        recognitionRef.current.stop();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        recognitionRef.current = null;
+        setIsRecognitionActive(false);
+      }
+    } catch (e) {
+      console.log('Recognition was not active');
     }
   };
 
-  const startRecognition = () => {
-    if (recognitionRef.current && !isRecognitionActive) {
-      try {
-        recognitionRef.current.start();
-        setIsRecognitionActive(true);
-      } catch (e) {
-        console.error('Error starting recognition:', e);
-        setError('Error starting speech recognition');
+  const startRecognition = async () => {
+    if (isRecognitionActive) return;
+
+    try {
+      if (!recognitionRef.current) {
+        initializeRecognition();
       }
+
+      // Add a small delay before starting
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      if (recognitionRef.current && !isRecognitionActive) {
+        recognitionRef.current.start();
+      }
+    } catch (e) {
+      console.error('Error starting recognition:', e);
+      setError('Error starting speech recognition');
+      setIsRecording(false);
+      setIsRecognitionActive(false);
     }
   };
 
@@ -85,42 +141,7 @@ const SpeechToTextConverter = () => {
       setIsSupported(isBrowserSupported);
 
       if (isBrowserSupported) {
-        recognitionRef.current = new SpeechRecognition();
-        recognitionRef.current.continuous = true;
-        recognitionRef.current.interimResults = true;
-        recognitionRef.current.lang = 'en-US';
-
-        recognitionRef.current.onresult = (event: any) => {
-          let finalTranscript = '';
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            if (event.results[i].isFinal) {
-              finalTranscript += event.results[i][0].transcript + ' ';
-            }
-          }
-          setTranscript((prev) => prev + finalTranscript);
-        };
-
-        recognitionRef.current.onerror = (event: any) => {
-          console.error('Speech recognition error:', event.error);
-          if (event.error !== 'no-speech') {
-            setError('Speech recognition error. Please try again.');
-            setIsRecording(false);
-          }
-        };
-
-        recognitionRef.current.onstart = () => {
-          setIsRecognitionActive(true);
-        };
-
-        recognitionRef.current.onend = () => {
-          setIsRecognitionActive(false);
-          // Only restart if we're still supposed to be recording
-          if (isRecording) {
-            setTimeout(() => {
-              startRecognition();
-            }, 100);
-          }
-        };
+        initializeRecognition();
 
         enumerateMicrophones();
         navigator.mediaDevices.addEventListener('devicechange', enumerateMicrophones);
@@ -140,7 +161,7 @@ const SpeechToTextConverter = () => {
 
     try {
       // Cleanup existing resources
-      stopRecognition();
+      await stopRecognition();
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
         streamRef.current = null;
@@ -158,17 +179,20 @@ const SpeechToTextConverter = () => {
 
       streamRef.current = stream;
 
-      // Small delay to ensure proper state
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Initialize new recognition instance
+      initializeRecognition();
+
+      // Ensure proper delay before starting
+      await new Promise(resolve => setTimeout(resolve, 300));
       
-      // Start recognition only if we're still supposed to be recording
-      if (isRecording) {
-        startRecognition();
+      if (isRecording && !isRecognitionActive) {
+        await startRecognition();
       }
     } catch (err) {
       console.error('Error accessing microphone:', err);
       setError('Error accessing selected microphone.');
       setIsRecording(false);
+      setIsRecognitionActive(false);
     }
   };
 
@@ -192,7 +216,8 @@ const SpeechToTextConverter = () => {
 
     if (isRecording) {
       setIsRecording(false);
-      stopRecognition();
+      setIsRecognitionActive(false);
+      await stopRecognition();
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
         streamRef.current = null;
@@ -219,11 +244,11 @@ const SpeechToTextConverter = () => {
     setTranscript('');
   };
 
-  const handleMicrophoneChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleMicrophoneChange = async (event: React.ChangeEvent<HTMLSelectElement>) => {
     const newMicrophoneId = event.target.value;
     const wasRecording = isRecording;
     
-    // Stop current recording
+    // Stop current recording and cleanup
     if (isRecording) {
       stopRecognition();
       if (streamRef.current) {
@@ -237,11 +262,12 @@ const SpeechToTextConverter = () => {
     setSelectedMicrophone(newMicrophoneId);
     localStorage.setItem('selectedMicrophone', newMicrophoneId);
 
+    // Ensure microphone change is processed before restarting
+    await new Promise(resolve => setTimeout(resolve, 100));
+
     // Restart recording if it was active
     if (wasRecording) {
-      setTimeout(() => {
-        setIsRecording(true);
-      }, 200);
+      setIsRecording(true);
     }
   };
 
