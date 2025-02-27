@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/router';
 
+interface DeviceInfo {
+  deviceId: string;
+  label: string;
+}
+
 const SpeechToTextConverter = () => {
   const router = useRouter();
   const [isRecording, setIsRecording] = useState(false);
@@ -9,9 +14,71 @@ const SpeechToTextConverter = () => {
   const [isCopied, setIsCopied] = useState(false);
   const [error, setError] = useState('');
   const recognitionRef = useRef<any>(null);
+  const [microphones, setMicrophones] = useState<DeviceInfo[]>([]);
+  const [selectedMicrophone, setSelectedMicrophone] = useState<string | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [isRecognitionActive, setIsRecognitionActive] = useState(false);
+
+  const enumerateMicrophones = async () => {
+    try {
+      // First get permission by requesting an audio stream
+      const initialStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Stop the initial stream right away - we just needed it for permissions
+      initialStream.getTracks().forEach(track => track.stop());
+
+      // Now enumerate devices - this should show labels since we have permission
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputDevices: DeviceInfo[] = devices
+        .filter((device) => device.kind === 'audioinput')
+        .map((device) => ({
+          deviceId: device.deviceId,
+          label: device.label || `Microphone ${device.deviceId.slice(0, 5)}...`,
+        }));
+
+      setMicrophones(audioInputDevices);
+      
+      // Select the first device by default if we don't have one selected
+      if (audioInputDevices.length > 0 && !selectedMicrophone) {
+        setSelectedMicrophone(audioInputDevices[0].deviceId);
+      }
+    } catch (err) {
+      console.error('Error accessing microphones:', err);
+      setError('Please grant microphone permission to use this app.');
+    } finally {
+      setIsInitializing(false);
+    }
+  };
+
+  const stopRecognition = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+        setIsRecognitionActive(false);
+      } catch (e) {
+        console.log('Recognition was not active');
+      }
+    }
+  };
+
+  const startRecognition = () => {
+    if (recognitionRef.current && !isRecognitionActive) {
+      try {
+        recognitionRef.current.start();
+        setIsRecognitionActive(true);
+      } catch (e) {
+        console.error('Error starting recognition:', e);
+        setError('Error starting speech recognition');
+      }
+    }
+  };
 
   useEffect(() => {
-    // Check if window is defined before accessing it
+    const savedMicrophoneId = localStorage.getItem('selectedMicrophone');
+    if (savedMicrophoneId) {
+      setSelectedMicrophone(savedMicrophoneId);
+    }
+
     if (typeof window !== 'undefined') {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       const isBrowserSupported = !!SpeechRecognition;
@@ -27,7 +94,7 @@ const SpeechToTextConverter = () => {
           let finalTranscript = '';
           for (let i = event.resultIndex; i < event.results.length; i++) {
             if (event.results[i].isFinal) {
-              finalTranscript += event.results[i][0].transcript;
+              finalTranscript += event.results[i][0].transcript + ' ';
             }
           }
           setTranscript((prev) => prev + finalTranscript);
@@ -35,42 +102,106 @@ const SpeechToTextConverter = () => {
 
         recognitionRef.current.onerror = (event: any) => {
           console.error('Speech recognition error:', event.error);
-          setError('Speech recognition error. Please try again.');
-          setIsRecording(false);
-        };
-
-        recognitionRef.current.onend = () => {
-          if (isRecording) {
-            recognitionRef.current.start();
+          if (event.error !== 'no-speech') {
+            setError('Speech recognition error. Please try again.');
+            setIsRecording(false);
           }
         };
 
-        // Only start recognition if isRecording is true, and cleanup correctly
-        if (isRecording) {
-          recognitionRef.current.start();
-        }
+        recognitionRef.current.onstart = () => {
+          setIsRecognitionActive(true);
+        };
+
+        recognitionRef.current.onend = () => {
+          setIsRecognitionActive(false);
+          // Only restart if we're still supposed to be recording
+          if (isRecording) {
+            setTimeout(() => {
+              startRecognition();
+            }, 100);
+          }
+        };
+
+        enumerateMicrophones();
+        navigator.mediaDevices.addEventListener('devicechange', enumerateMicrophones);
+        
+        return () => {
+          stopRecognition();
+          if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+          }
+        };
       }
     }
+  }, []);
 
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
+  const setupAudioStream = async () => {
+    if (!isSupported || !selectedMicrophone || !isRecording) return;
+
+    try {
+      // Cleanup existing resources
+      stopRecognition();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
       }
-    };
-  }, [isRecording]); // Only depend on isRecording
 
-  const toggleRecording = () => {
+      // Get new stream with selected device
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: selectedMicrophone },
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      streamRef.current = stream;
+
+      // Small delay to ensure proper state
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Start recognition only if we're still supposed to be recording
+      if (isRecording) {
+        startRecognition();
+      }
+    } catch (err) {
+      console.error('Error accessing microphone:', err);
+      setError('Error accessing selected microphone.');
+      setIsRecording(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isRecording && selectedMicrophone) {
+      setupAudioStream();
+    } else {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      stopRecognition();
+    }
+  }, [isRecording, selectedMicrophone]);
+
+  const toggleRecording = async () => {
     if (!isSupported) {
       setError('Your browser does not support speech recognition.');
       return;
     }
 
     if (isRecording) {
-      recognitionRef.current.stop();
+      setIsRecording(false);
+      stopRecognition();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
     } else {
+      setError('');
       setTranscript('');
+      setIsRecording(true);
     }
-    setIsRecording(!isRecording);
   };
 
   const copyToClipboard = () => {
@@ -86,6 +217,32 @@ const SpeechToTextConverter = () => {
 
   const clearTranscript = () => {
     setTranscript('');
+  };
+
+  const handleMicrophoneChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const newMicrophoneId = event.target.value;
+    const wasRecording = isRecording;
+    
+    // Stop current recording
+    if (isRecording) {
+      stopRecognition();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      setIsRecording(false);
+    }
+
+    // Update microphone selection
+    setSelectedMicrophone(newMicrophoneId);
+    localStorage.setItem('selectedMicrophone', newMicrophoneId);
+
+    // Restart recording if it was active
+    if (wasRecording) {
+      setTimeout(() => {
+        setIsRecording(true);
+      }, 200);
+    }
   };
 
   if (!isSupported) {
@@ -105,111 +262,119 @@ const SpeechToTextConverter = () => {
   }
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="w-full max-w-md p-6 bg-white rounded-lg shadow-md">
-        <h1 className="text-2xl font-bold text-center text-gray-800 mb-6">
-          Speech to Text Converter
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-gray-50 to-gray-100">
+      <div className="w-full max-w-md p-6 bg-white rounded-2xl shadow-lg">
+        <h1 className="text-2xl font-semibold text-center text-gray-800 mb-6">
+          Voice to Text
         </h1>
+        
         {error && (
-          <div
-            className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4"
-            role="alert"
-          >
-            <strong className="font-bold">Error:</strong>{' '}
-            <span className="block sm:inline">{error}</span>
+          <div className="mb-4 px-4 py-3 bg-red-50 rounded-xl border border-red-100">
+            <p className="text-red-600 text-sm">{error}</p>
           </div>
         )}
-        <div className="mb-6">
+
+        {isInitializing ? (
+          <div className="mb-4 flex items-center justify-center space-x-2">
+            <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-gray-900"></div>
+            <p className="text-gray-600">Initializing...</p>
+          </div>
+        ) : microphones.length > 0 ? (
+          <div className="mb-6">
+            <div className="flex justify-between items-center mb-2">
+              <label htmlFor="microphone-select" className="text-sm font-medium text-gray-600">
+                Input Device
+              </label>
+              <button
+                onClick={enumerateMicrophones}
+                className="text-sm text-blue-500 hover:text-blue-600 transition-colors"
+              >
+                Refresh
+              </button>
+            </div>
+            <select
+              id="microphone-select"
+              className="w-full px-4 py-2 rounded-xl border border-gray-200 focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all"
+              value={selectedMicrophone || ''}
+              onChange={handleMicrophoneChange}
+            >
+              {microphones.map((microphone) => (
+                <option key={microphone.deviceId} value={microphone.deviceId}>
+                  {microphone.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <div className="mb-6 text-center">
+            <p className="text-gray-600 mb-2">No microphones found</p>
+            <button
+              onClick={enumerateMicrophones}
+              className="px-4 py-2 bg-blue-500 text-white rounded-full text-sm hover:bg-blue-600 transition-colors"
+            >
+              Check Again
+            </button>
+          </div>
+        )}
+
+        <div className="mb-6 flex flex-col items-center">
           <button
             onClick={toggleRecording}
-            className={`w-20 h-20 rounded-full flex items-center justify-center focus:outline-none transition-all duration-300 ${
-              isRecording ? 'bg-red-500 text-white' : 'bg-blue-500 text-white'
+            className={`w-20 h-20 rounded-full flex items-center justify-center transition-all duration-300 ${
+              isRecording 
+                ? 'bg-red-500 hover:bg-red-600 shadow-lg scale-110' 
+                : 'bg-blue-500 hover:bg-blue-600 shadow'
             }`}
             aria-label={isRecording ? 'Stop recording' : 'Start recording'}
           >
-            <span className={`${isRecording ? 'text-white' : 'text-white'}`}>
-              {isRecording ? (
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-6 w-6"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
+            {isRecording ? (
+              <div className="flex flex-col items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-white" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 002 0V8a1 1 0 00-1-1zm4 0a1 1 0 00-1 1v4a1 1 0 002 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
                 </svg>
-              ) : (
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-6 w-6"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.657z"
-                  />
+                <span className="text-xs text-white mt-1">Stop</span>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-white" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clipRule="evenodd" />
                 </svg>
-              )}
-            </span>
+                <span className="text-xs text-white mt-1">Record</span>
+              </div>
+            )}
           </button>
+          
+          <p className="mt-4 text-sm text-gray-500">
+            {isRecording ? 'Listening...' : 'Tap to start'}
+          </p>
         </div>
 
         <div className="mb-4">
           <textarea
-            className="w-full h-40 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none text-base"
-            placeholder="Your speech will appear here..."
+            className="w-full h-40 p-4 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-200 resize-none text-base bg-gray-50"
+            placeholder="Your words will appear here..."
             value={transcript}
             readOnly
           ></textarea>
+          
           {transcript && (
             <div className="flex justify-end mt-2 space-x-2">
               <button
                 onClick={copyToClipboard}
-                className="p-2 bg-gray-200 rounded-md hover:bg-gray-300 focus:outline-none"
+                className="p-2 text-blue-500 hover:bg-blue-50 rounded-xl transition-colors"
                 title="Copy to clipboard"
               >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-5 w-5 text-gray-600"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2h-2m-4-2v4m8-4h.01M18 10a3 3 0 100-6 3 3 0 000 6z"
-                  />
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" />
                 </svg>
               </button>
               <button
                 onClick={clearTranscript}
-                className="p-2 bg-gray-200 rounded-md hover:bg-gray-300 focus:outline-none"
+                className="p-2 text-gray-500 hover:bg-gray-50 rounded-xl transition-colors"
                 title="Clear text"
               >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  className="h-5 w-5 text-gray-600"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
               </button>
             </div>
@@ -217,18 +382,13 @@ const SpeechToTextConverter = () => {
         </div>
 
         {isCopied && (
-          <div className="text-center text-green-600 mb-4">
-            Copied to clipboard!
+          <div className="text-center text-sm text-green-500 mb-4">
+            Copied ✓
           </div>
         )}
-
-        <p className="text-center text-sm text-gray-500">
-          Speak clearly into your microphone.
-        </p>
       </div>
     </div>
   );
 };
 
 export default SpeechToTextConverter;
-
